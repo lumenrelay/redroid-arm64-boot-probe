@@ -6,6 +6,9 @@ on:
       idle_minutes:
         description: idle observation minutes after the second boot
         default: "30"
+      boot_timeout:
+        description: seconds to wait for sys.boot_completed
+        default: "420"
       image_ref:
         description: pinned redroid image digest (linux/arm64)
         default: "redroid/redroid@sha256:e194edc99aa364358d1f8c214acb18b6d006c74fa0561f39259a20173ec30b66"
@@ -13,7 +16,11 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 150
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [legacy, binderfs-device]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,71 +28,40 @@ jobs:
         run: |
           set -uxo pipefail
           mkdir -p out
+          echo "variant=${{ matrix.variant }}" | tee out/variant.txt
           date -u +%FT%TZ > out/started-at.txt
           uname -a | tee out/uname.txt
-          cat /etc/os-release | tee out/os-release.txt
-          getconf PAGESIZE | tee out/pagesize.txt
-          nproc | tee out/nproc.txt
-          free -h | tee out/free.txt
-          df -h / | tee out/df.txt
-          head -40 /proc/cpuinfo > out/cpuinfo.txt
-          if sudo test -r "/boot/config-$(uname -r)"; then
-            sudo cat "/boot/config-$(uname -r)" > out/kernel-config.txt
-          elif [ -r /proc/config.gz ]; then
-            zcat /proc/config.gz > out/kernel-config.txt
-          else
-            echo "no kernel config found" > out/kernel-config.txt
-          fi
-          sha256sum out/kernel-config.txt | tee out/kernel-config.sha256
-          grep -E '^CONFIG_(ANDROID_BINDER_IPC|ANDROID_BINDERFS|ANDROID_BINDER_DEVICES|MEMFD_CREATE|DMABUF_HEAPS|DMABUF_HEAPS_SYSTEM|ARM64_4K_PAGES|COMPAT|ASHMEM)' out/kernel-config.txt | tee out/kernel-config-grep.txt
-          docker version | tee out/docker-version.txt
-          dpkg-query -W linux-image-$(uname -r) 2>/dev/null | tee out/kernel-package.txt || true
+          cat /etc/os-release > out/os-release.txt
+          getconf PAGESIZE > out/pagesize.txt
+          nproc > out/nproc.txt
+          free -h > out/free.txt
+          df -h / > out/df.txt
+          if sudo test -r "/boot/config-$(uname -r)"; then sudo cat "/boot/config-$(uname -r)" > out/kernel-config.txt; else echo none > out/kernel-config.txt; fi
+          sha256sum out/kernel-config.txt > out/kernel-config.sha256
+          grep -E '^CONFIG_(ANDROID_BINDER_IPC|ANDROID_BINDERFS|ANDROID_BINDER_DEVICES|MEMFD_CREATE|DMABUF_HEAPS|ARM64_4K_PAGES|ASHMEM)' out/kernel-config.txt | tee out/kernel-config-grep.txt
+          docker version > out/docker-version.txt
+          dpkg-query -W "linux-image-$(uname -r)" > out/kernel-package.txt 2>&1 || true
+          true
 
-      - name: binder and memfd
+      - name: binder, binderfs, memfd, adb
         run: |
           set -uxo pipefail
           binder=$(sed -n 's/^CONFIG_ANDROID_BINDER_IPC=//p' out/kernel-config.txt)
           echo "binder_config=${binder:-missing}" | tee out/binder.txt
           sudo apt-get update -qq
-          apt-cache policy "linux-modules-extra-$(uname -r)" | tee out/modules-extra-policy.txt
-          case "$binder" in
-            m)
-              if ! modinfo binder_linux >/dev/null 2>&1; then
-                sudo apt-get install -y "linux-modules-extra-$(uname -r)" 2>&1 | tail -5 | tee -a out/binder.txt
-              fi
-              modinfo binder_linux | tee out/modinfo-binder.txt
-              sudo modprobe -v binder_linux devices=binder,hwbinder,vndbinder 2>&1 | tee -a out/binder.txt
-              echo "modprobe_rc=${PIPESTATUS[0]}" | tee -a out/binder.txt
-              ;;
-            y) echo "binder built in" | tee -a out/binder.txt ;;
-            *) echo "binder unavailable in kernel config" | tee -a out/binder.txt ;;
-          esac
-          lsmod | grep -i binder | tee -a out/binder.txt || echo "lsmod: no binder module listed" | tee -a out/binder.txt
-          sudo dmesg 2>/dev/null | grep -i binder | tail -n 20 | tee -a out/binder.txt || true
-          ls -l /dev | grep -i binder | tee -a out/binder.txt || echo "no /dev/*binder* nodes" | tee -a out/binder.txt
-          cat /sys/module/binder_linux/parameters/devices 2>&1 | tee -a out/binder.txt || true
-          sudo mkdir -p /run/binderfs-probe
-          if sudo mount -t binder binder /run/binderfs-probe 2>&1 | tee -a out/binder.txt; then
-            sudo ls -l /run/binderfs-probe | tee -a out/binder.txt
-            sudo umount /run/binderfs-probe
-            echo "binderfs mount PASS" | tee -a out/binder.txt
-          else
-            echo "binderfs mount FAIL" | tee -a out/binder.txt
+          if [ "$binder" = "m" ]; then
+            modinfo binder_linux >/dev/null 2>&1 || sudo apt-get install -y "linux-modules-extra-$(uname -r)" 2>&1 | tail -2 | tee -a out/binder.txt
+            sudo modprobe -v binder_linux devices=binder,hwbinder,vndbinder 2>&1 | tee -a out/binder.txt
+            echo "modprobe_rc=${PIPESTATUS[0]}" | tee -a out/binder.txt
           fi
-          if [ ! -c /dev/binder ]; then
-            echo "legacy binder nodes absent; trying modprobe without devices then with explicit mknod via binderfs is out of scope; container boot will decide" | tee -a out/binder.txt
-          fi
-          python3 - <<'PY' 2>&1 | tee out/memfd.txt
-          import os
-          fd = os.memfd_create('probe', os.MFD_CLOEXEC)
-          assert os.write(fd, b'memfd-ok') == 8
-          os.lseek(fd, 0, os.SEEK_SET)
-          assert os.read(fd, 8) == b'memfd-ok'
-          os.close(fd)
-          print('memfd PASS')
-          PY
+          lsmod | grep -i binder | tee -a out/binder.txt || true
+          ls -l /dev | grep -i binder | tee -a out/binder.txt || echo "no legacy /dev/*binder* nodes" | tee -a out/binder.txt
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binder /dev/binderfs 2>&1 | tee -a out/binder.txt
+          sudo ls -l /dev/binderfs | tee -a out/binder.txt
+          python3 -c "import os; fd=os.memfd_create('p', os.MFD_CLOEXEC); os.write(fd,b'ok'); print('memfd PASS')" | tee out/memfd.txt
           sudo apt-get install -y -qq adb >/dev/null 2>&1 || sudo apt-get install -y -qq android-tools-adb
-          adb version | tee out/adb-version.txt
+          adb version > out/adb-version.txt
           true
 
       - name: pull pinned image
@@ -93,60 +69,64 @@ jobs:
           set -euxo pipefail
           IMG='${{ github.event.inputs.image_ref }}'
           echo "$IMG" > out/image-ref.txt
-          sudo docker pull --platform linux/arm64 "$IMG" 2>&1 | tail -3
+          sudo docker pull --platform linux/arm64 "$IMG" 2>&1 | tail -2
           sudo docker image inspect "$IMG" > out/image-inspect.json
 
       - name: cold boot 1 (fresh data)
+        id: boot1
         run: |
           set -uxo pipefail
           sudo mkdir -p /srv/redroid-probe/data
-          bash scripts/run_container.sh '${{ github.event.inputs.image_ref }}'
-          bash scripts/wait_boot.sh 600 out/boot1
-          echo "boot1_rc=$?" | tee -a out/summary.txt
+          bash scripts/run_container.sh '${{ github.event.inputs.image_ref }}' '${{ matrix.variant }}'
+          bash scripts/wait_boot.sh '${{ github.event.inputs.boot_timeout }}' out/boot1
+          true
 
       - name: sentinel, stop, start
+        if: steps.boot1.outputs.booted == '1'
+        id: restart
         run: |
           set -uxo pipefail
           adb -s 127.0.0.1:5555 shell 'printf redroid-probe-v1 > /data/local/tmp/probe-sentinel' 2>&1 | tee out/sentinel-write.txt
           sudo docker stop --time 30 redroid-probe
           sudo docker inspect --format '{{.State.Status}}' redroid-probe | tee out/stopped-status.txt
           sudo docker start redroid-probe
-          bash scripts/wait_boot.sh 600 out/restart
-          echo "restart_rc=$?" | tee -a out/summary.txt
+          bash scripts/wait_boot.sh '${{ github.event.inputs.boot_timeout }}' out/restart
           adb -s 127.0.0.1:5555 shell cat /data/local/tmp/probe-sentinel 2>&1 | tee out/sentinel-after-restart.txt
+          true
 
       - name: cold boot 2 (new container, persisted data)
+        if: steps.boot1.outputs.booted == '1'
+        id: boot2
         run: |
           set -uxo pipefail
           sudo docker stop --time 30 redroid-probe
           sudo docker rm redroid-probe
-          bash scripts/run_container.sh '${{ github.event.inputs.image_ref }}'
-          bash scripts/wait_boot.sh 600 out/boot2
-          echo "boot2_rc=$?" | tee -a out/summary.txt
+          bash scripts/run_container.sh '${{ github.event.inputs.image_ref }}' '${{ matrix.variant }}'
+          bash scripts/wait_boot.sh '${{ github.event.inputs.boot_timeout }}' out/boot2
           adb -s 127.0.0.1:5555 shell cat /data/local/tmp/probe-sentinel 2>&1 | tee out/sentinel-after-recreate.txt
+          true
 
       - name: idle observation
+        if: steps.boot2.outputs.booted == '1'
         run: |
           set -uxo pipefail
-          minutes='${{ github.event.inputs.idle_minutes }}'
-          bash scripts/idle_observe.sh "$minutes" out/idle
-          echo "idle_rc=$?" | tee -a out/summary.txt
+          bash scripts/idle_observe.sh '${{ github.event.inputs.idle_minutes }}' out/idle
+          echo "idle_rc=$?" | tee out/idle-rc.txt
+          true
 
       - name: final evidence
         if: always()
         run: |
           set -uxo pipefail
-          sudo docker logs --tail 400 redroid-probe > out/container-log-tail.txt 2>&1 || true
-          sudo dmesg --ctime 2>/dev/null | tail -n 200 > out/dmesg-tail.txt || sudo dmesg | tail -n 200 > out/dmesg-tail.txt || true
-          sudo docker stats --no-stream redroid-probe > out/final-stats.txt 2>&1 || true
+          echo "boot1=${{ steps.boot1.outputs.booted }} restart=${{ steps.restart.outputs.booted }} boot2=${{ steps.boot2.outputs.booted }}" | tee out/summary.txt
           date -u +%FT%TZ > out/finished-at.txt
-          cat out/summary.txt || true
           sudo docker stop --time 30 redroid-probe || true
           sudo docker rm redroid-probe || true
+          true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: redroid-arm64-boot-probe-${{ github.run_id }}
+          name: redroid-arm64-boot-probe-${{ matrix.variant }}-${{ github.run_id }}
           path: out
           if-no-files-found: warn

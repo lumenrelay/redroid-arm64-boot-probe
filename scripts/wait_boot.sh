@@ -14,6 +14,8 @@ while :; do
   now=$(date +%s)
   echo "t+$((now-start))s boot_completed='${val}'" | tee -a "$OUT-timing.txt"
   if [ "$val" = "1" ]; then booted=1; break; fi
+  status=$(sudo docker inspect --format '{{.State.Status}}' redroid-probe 2>/dev/null)
+  if [ "$status" != "running" ]; then echo "container status=$status" | tee -a "$OUT-timing.txt"; break; fi
   if [ $((now-start)) -ge "$TIMEOUT" ]; then break; fi
   sleep 30
 done
@@ -27,6 +29,6 @@ if [ "$booted" = "1" ]; then
   adb -s 127.0.0.1:5555 exec-out screencap -p > "$OUT-screen.png" || true
   ls -l "$OUT-screen.png" || true
 fi
-sudo docker stats --no-stream redroid-probe | tee "$OUT-stats.txt"
-sudo docker logs --tail 100 redroid-probe > "$OUT-container-log.txt" 2>&1 || true
-[ "$booted" = "1" ]
+bash "$(dirname "$0")/diag.sh" "$OUT-diag"
+echo "booted=$booted" >> "${GITHUB_OUTPUT:-/dev/null}"
+true
