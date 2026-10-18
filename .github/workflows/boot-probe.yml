@@ -54,12 +54,16 @@ jobs:
                 sudo apt-get install -y "linux-modules-extra-$(uname -r)" 2>&1 | tail -5 | tee -a out/binder.txt
               fi
               modinfo binder_linux | tee out/modinfo-binder.txt
-              sudo modprobe binder_linux devices=binder,hwbinder,vndbinder 2>&1 | tee -a out/binder.txt
+              sudo modprobe -v binder_linux devices=binder,hwbinder,vndbinder 2>&1 | tee -a out/binder.txt
+              echo "modprobe_rc=${PIPESTATUS[0]}" | tee -a out/binder.txt
               ;;
             y) echo "binder built in" | tee -a out/binder.txt ;;
             *) echo "binder unavailable in kernel config" | tee -a out/binder.txt ;;
           esac
-          ls -l /dev/binder /dev/hwbinder /dev/vndbinder 2>&1 | tee -a out/binder.txt
+          lsmod | grep -i binder | tee -a out/binder.txt || echo "lsmod: no binder module listed" | tee -a out/binder.txt
+          sudo dmesg 2>/dev/null | grep -i binder | tail -n 20 | tee -a out/binder.txt || true
+          ls -l /dev | grep -i binder | tee -a out/binder.txt || echo "no /dev/*binder* nodes" | tee -a out/binder.txt
+          cat /sys/module/binder_linux/parameters/devices 2>&1 | tee -a out/binder.txt || true
           sudo mkdir -p /run/binderfs-probe
           if sudo mount -t binder binder /run/binderfs-probe 2>&1 | tee -a out/binder.txt; then
             sudo ls -l /run/binderfs-probe | tee -a out/binder.txt
@@ -67,6 +71,9 @@ jobs:
             echo "binderfs mount PASS" | tee -a out/binder.txt
           else
             echo "binderfs mount FAIL" | tee -a out/binder.txt
+          fi
+          if [ ! -c /dev/binder ]; then
+            echo "legacy binder nodes absent; trying modprobe without devices then with explicit mknod via binderfs is out of scope; container boot will decide" | tee -a out/binder.txt
           fi
           python3 - <<'PY' 2>&1 | tee out/memfd.txt
           import os
@@ -79,6 +86,7 @@ jobs:
           PY
           sudo apt-get install -y -qq adb >/dev/null 2>&1 || sudo apt-get install -y -qq android-tools-adb
           adb version | tee out/adb-version.txt
+          true
 
       - name: pull pinned image
         run: |
