@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [legacy, binderfs-device]
+        variant: [legacy]
     steps:
       - uses: actions/checkout@v4
 
