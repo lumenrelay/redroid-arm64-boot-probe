@@ -1,0 +1,90 @@
+name: redroid 13 arm64 + MindTheGapps probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_timeout:
+        description: seconds to wait for sys.boot_completed
+        default: "420"
+      redroid_script_ref:
+        description: pinned commit of ayasa520/redroid-script
+        default: "a4951b782fc8e06c845d9553bf07bb643fd8c158"
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: host facts and binder
+        run: |
+          set -uxo pipefail
+          mkdir -p out
+          date -u +%FT%TZ > out/started-at.txt
+          uname -a | tee out/uname.txt
+          nproc > out/nproc.txt; free -h > out/free.txt; df -h / > out/df.txt
+          sudo cat "/boot/config-$(uname -r)" > out/kernel-config.txt 2>/dev/null || echo none > out/kernel-config.txt
+          sha256sum out/kernel-config.txt > out/kernel-config.sha256
+          sudo apt-get update -qq
+          modinfo binder_linux >/dev/null 2>&1 || sudo apt-get install -y "linux-modules-extra-$(uname -r)" 2>&1 | tail -1
+          sudo modprobe -v binder_linux devices=binder,hwbinder,vndbinder 2>&1 | tee out/binder.txt
+          sudo mkdir -p /dev/binderfs && sudo mount -t binder binder /dev/binderfs 2>&1 | tee -a out/binder.txt
+          sudo ls -l /dev/binderfs | tee -a out/binder.txt
+          sudo apt-get install -y -qq adb lzip >/dev/null 2>&1 || sudo apt-get install -y -qq android-tools-adb lzip
+          adb version > out/adb-version.txt
+          true
+
+      - name: build image with redroid-script (MindTheGapps, Android 13)
+        run: |
+          set -uxo pipefail
+          REF='${{ github.event.inputs.redroid_script_ref }}'
+          git clone -q https://github.com/ayasa520/redroid-script.git rs
+          git -C rs checkout -q "$REF"
+          git -C rs rev-parse HEAD | tee out/redroid-script-commit.txt
+          sha256sum rs/redroid.py rs/stuff/mindthegapps.py rs/tools/helper.py rs/stuff/general.py > out/redroid-script-hashes.txt
+          python3 -m pip install -q -r rs/requirements.txt 2>&1 | tail -2
+          export XDG_CACHE_HOME="$HOME/.cache"
+          docker pull --platform linux/arm64 redroid/redroid:13.0.0-latest 2>&1 | tail -2
+          docker image inspect redroid/redroid:13.0.0-latest --format '{{.Id}} {{.RepoDigests}}' | tee out/base-image.txt
+          ( cd rs && python3 redroid.py -a 13.0.0 -mtg -c docker ) 2>&1 | grep -v -E "^\s*[0-9.]+[kMG]?iB" | tail -40 | tee out/redroid-script-build.log
+          ls -l "$HOME/.cache/redroid/downloads/" | tee out/mtg-download.txt
+          sha256sum "$HOME/.cache/redroid/downloads/mindthegapps.zip" | tee -a out/mtg-download.txt
+          md5sum "$HOME/.cache/redroid/downloads/mindthegapps.zip" | tee -a out/mtg-download.txt
+          docker image inspect redroid/redroid:13.0.0_mindthegapps --format '{{.Id}} {{.Size}} {{.Config.Entrypoint}}' | tee out/built-image.txt
+          cat rs/Dockerfile | tee out/Dockerfile.txt
+          true
+
+      - name: cold boot with GApps image
+        id: boot1
+        run: |
+          set -uxo pipefail
+          sudo mkdir -p /srv/redroid-probe/data
+          bash scripts/run_container.sh redroid/redroid:13.0.0_mindthegapps legacy
+          bash scripts/wait_boot.sh '${{ github.event.inputs.boot_timeout }}' out/boot1
+          true
+
+      - name: play store probe (no sign-in)
+        if: steps.boot1.outputs.booted == '1'
+        run: |
+          set -uxo pipefail
+          sleep 60
+          bash scripts/play_probe.sh out/play
+          true
+
+      - name: final evidence
+        if: always()
+        run: |
+          set -uxo pipefail
+          echo "boot1=${{ steps.boot1.outputs.booted }}" | tee out/summary.txt
+          date -u +%FT%TZ > out/finished-at.txt
+          sudo docker stop --time 30 redroid-probe || true
+          sudo docker rm redroid-probe || true
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: redroid13-mtg-probe-${{ github.run_id }}
+          path: out
+          if-no-files-found: warn
